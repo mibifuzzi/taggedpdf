@@ -8,6 +8,7 @@ from pikepdf import Pdf, Dictionary, Array, Name
 
 from .structtree import StructTreeRoot
 from .content import extract_content
+from .bbox import BBox
 from .logger import logger
 
 
@@ -26,6 +27,7 @@ class TaggedPdf:
     def __init__(self, pdf_path, skip_content=False):
         self.pdf = Pdf.open(pdf_path)
         self.dictionary = d = self.pdf.Root
+        self.nonmarked_by_page = None
 
         # See 7.7.2 "Document Catalog" and Table 28 "Entries in the
         # catalog dictionary" in Reference. Only parsed partially.
@@ -64,7 +66,7 @@ class TaggedPdf:
                     continue
                 struct_elem._add_page(page_idx)
 
-        # Attach content items to structure elements
+        # Attach content items to structure elements (TODO: make lazy?)
         if not skip_content:
             extracted = extract_content(pdf_path)
             for page in extracted.items_by_page_and_mcid:
@@ -73,7 +75,13 @@ class TaggedPdf:
                     if struct_elem is None:
                         continue    # TODO figure out why these can miss
                     for item in extracted.items_by_page_and_mcid[page][mcid]:
-                        struct_elem.add_content_item(page, item)
+                        struct_elem.add_content_item(page, item, mcid)
+            # also store content outside structure
+            self.nonmarked_by_page = extracted.nonmarked_items_by_page
+
+    @property
+    def page_count(self):
+        return len(self.pdf.pages)
 
     def get_struct_elem(self, page, mcid):
         # From 14.7.4.4 "Finding Structure Elements from Content
@@ -110,3 +118,6 @@ class TaggedPdf:
         # Grab StructElem object using objgen lookup.
         struct_elem = struct_tree.get_element(parent.objgen)
         return struct_elem
+
+    def get_cropbox(self, page_index):
+        return BBox.from_pikepdf_array(self.pdf.pages[page_index].cropbox)
