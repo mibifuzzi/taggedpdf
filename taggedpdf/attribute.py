@@ -1,6 +1,8 @@
 # PDF structure element attribute. Reference: PDF 32000-1:2008:
 # https://www.adobe.com/content/dam/acom/en/devnet/pdf/pdfs/PDF32000_2008.pdf.
 
+from decimal import Decimal
+
 from pikepdf import Name, Array
 
 from .utils import clean_xml_attr
