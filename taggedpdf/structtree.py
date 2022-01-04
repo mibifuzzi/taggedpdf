@@ -8,6 +8,7 @@ from taggedpdf import parsing
 from pikepdf import Dictionary, Array, Name
 
 from .attribute import Attribute
+from .bbox import BBox
 from .structtype import ElementType, is_standard_type, struct_type_category
 from .treedict import NameTree, NumberTree
 from .utils import clean_xml_attr
@@ -63,8 +64,9 @@ class StructTreeRoot:
         return self.element_map.get(objgen)
 
     def nodes(self):
+        # self not included as root has a distinct, incompatible type
         for child in self.children:
-            yield from child.nodes()
+            yield from child.subtree_nodes()
 
     def write_struct_tree(self, fmt=OutputFormat.pdfinfo, out=sys.stdout):
         indent = 0 if fmt != OutputFormat.xml else 1
@@ -83,15 +85,43 @@ class StructElemBase:
         self.parent = parent
         self.attributes = []
         self.children = []
-        self._content_by_page = {}
         self._pages = set()
         self.struct_type = None
         self.mcid = None
         self._bbox_cache = None
 
-    def bbox(self, page):
+    def get_page_indices(self):
+        """Return zero-based indices of pages on which content in the
+        subtree rooted at this node appears."""
+        return sorted(self._pages)
+
+    def get_bbox(self, page):
+        """Return the bounding box of the content in the subtree rooted
+        at this node for the given page."""
         self._update_bbox_cache()
         return self._bbox_cache.get(page, None)
+
+    def get_content(self, page=None, recursive=False):
+        if not recursive:
+            return self._get_direct_content(page)
+        else:
+            return self._get_subtree_content(page)
+
+    def get_content_text(self, page=None, recursive=False):
+        text = []
+        for item in self.get_content(page, recursive):
+            try:
+                text.append(item.get_text())
+            except:
+                # this is expected to fail for non-text layout items
+                logger.info(f'failed get_text() for {item}')
+        return ''.join(text)
+
+    def _get_direct_content(self, page=None):
+        raise NotImplementedError
+
+    def _get_subtree_content(self, page=None):
+        raise NotImplementedError
 
     def _update_bbox_cache(self):
         if self._bbox_cache is not None:
@@ -109,7 +139,6 @@ class StructElemBase:
         ]
 
         if attr_bboxes and len(pages) != 1:
-            print(pages)
             self.write_struct_tree(fmt=OutputFormat.pdfinfo)
             logger.error('cannot resolve page for /BBox, removing')
             attr_bboxes = []
@@ -126,26 +155,24 @@ class StructElemBase:
             # subtree, and bbox attributes in the current element
             content_bboxes = [
                 BBox(*item.bbox)
-                for item in self._content_by_page.get(page, [])
+                for item in self.get_content(page)
                 if not is_space_text_item(item)
             ]
             subtree_bboxes = [
-                node.bbox(page) for node in self.nodes(include_self=False)
-                if node.bbox(page) is not None
+                node.get_bbox(page)
+                for node in self.subtree_nodes(include_self=False)
+                if node.get_bbox(page) is not None
             ]
-            self._bbox_cache[page] = BBox.union(
+            self._bbox_cache[page] = BBox.Union(
                 content_bboxes + subtree_bboxes + attr_bboxes
             )
 
-    def bboxes(self, include_space=False):
-        return [self.bbox(i) for i in self._pages]
-
-    def _invalidate_bbox_cache(self):
+    def _invalidate_caches(self):
         if self._bbox_cache is not None:
-            # had a previously calculated bbox, clear and propagate
+            # had cached data, clear and propagate
             self._bbox_cache = None
             if self.parent is not None:
-                self.parent._invalidate_bbox_cache()
+                self.parent._invalidate_caches()
 
     def _add_page(self, page):
         if page not in self._pages:
@@ -154,12 +181,13 @@ class StructElemBase:
             if self.parent is not None:
                 self.parent._add_page(page)
 
-    def add_content_item(self, page, item):
+    def _add_content_item(self, page, item, mcid):
+        raise NotImplementedError
+
+    def add_content_item(self, page, item, mcid):
         self._add_page(page)
-        if page not in self._content_by_page:
-            self._content_by_page[page] = []
-        self._content_by_page[page].append(item)
-        self._invalidate_bbox_cache()
+        self._invalidate_caches()
+        self._add_content_item(page, item, mcid)
 
     def is_block(self):
         return struct_type_category(self.struct_type) == ElementType.Block
@@ -185,11 +213,11 @@ class StructElemBase:
     def print_indent(self, indent, out):
         print('  '*indent, end='', file=out)
 
-    def nodes(self, include_self=True):
+    def subtree_nodes(self, include_self=True):
         if include_self:
             yield self
         for child in self.children:
-            yield from child.nodes()
+            yield from child.subtree_nodes()
 
     def add_child(self, element):
         try:
@@ -211,7 +239,8 @@ class StructElemBase:
                 element[Name.Type] == Name.StructElem):
                 return StructElem(element, self.root, self)
             elif element[Name.Type] == Name.MCR:
-                return MCRefStructElem(element, self.root, self)
+                #return MCRefStructElem(element, self.root, self)
+                return MCIDStructElem.from_dictionary(element, self.root, self)
             elif element[Name.Type] == Name.OBJR:
                 return ObjRefStructElem(element, self.root, self)
             else:
@@ -247,11 +276,12 @@ class StructElem(StructElemBase):
             self.root.role_map.get(self.struct_type) is not None):
             self.struct_type = self.root.role_map.get(self.struct_type)
 
-        # Empty structure types ("/") seem to appear in some documents.
-        # Poppler refuses to create these, fo follow suite.
-        # (TODO: also check for conformance for other types.)
-        if self.struct_type == '/':
-            raise ValueError(f'wrong type "{self.struct_type}"')
+        # Any type that remains non-standard at this point is mapped
+        # to "Unknown"
+        if not is_standard_type(self.struct_type):
+            logger.warning(f'mapping nonstandard structure type '
+                           f'"{self.struct_type}" to "/Unknown"')
+            self.struct_type = Name.Unknown
 
         # Parent (P) is a required indirect reference to a dictionary,
         # but arrays appear in some PDFs. Poppler StructElement.cc
@@ -294,31 +324,6 @@ class StructElem(StructElemBase):
         self.expanded = parsing.get_string(dictionary, Name.E)
         self.actual_text = parsing.get_string(dictionary, Name.ActualText)
 
-    def get_content(self):
-        return [
-            item for page, items in sorted(self._content_by_page.items())
-            for item in items
-        ]
-
-    def get_content_text(self):
-        text = []
-        for item in self.get_content():
-            try:
-                text.append(item.get_text())
-            except:
-                # this is expected to fail for non-text layout items
-                logger.info(f'failed get_text() for {item}')
-        return ''.join(text)
-
-    def get_nontext_content(self):
-        items = []
-        for item in self.get_content():
-            try:
-                item.get_text()
-            except:
-                items.append(item)
-        return items
-
     def get_id(self):
         return self.id
 
@@ -327,6 +332,27 @@ class StructElem(StructElemBase):
 
     def is_objref(self):
         return False
+
+    def _add_content_item(self, page, item, mcid):
+        # content attaches to child with given MCID to keep track of
+        # content order.
+        for child in self.children:
+            if child.mcid == mcid:
+                child.add_content_item(page, item, mcid)
+                return True
+        raise ValueError(f'failed to attach content to {mcid} on page {page}')
+
+    def _get_direct_content(self, page=None):
+        return []    # content only in leaves
+
+    def _get_subtree_content(self, page=None):
+        items = []
+        for node in self.subtree_nodes():
+            try:
+                items.extend(node._get_direct_content(page))
+            except:
+                pass
+        return items
 
     def write_struct_tree_pdfinfo(self, fmt, indent=0, out=sys.stdout):
         self.print_indent(indent, out)
@@ -347,16 +373,16 @@ class StructElem(StructElemBase):
         else:
             write('\n')
         if self.get_content():
-            self.print_indent(indent+1, out)
-            write(f'"{self.get_content_text()}"\n')
+            # Only leaf nodes should hold content
+            raise ValueError('unexpected content')
 
         for child in self.children:
             child.write_struct_tree(fmt, indent+1, out)
 
     def deduplicated_attributes(self):
-        # PDF can have multiple attributes with the same name, but
-        # some output formats such as XML cannot. As duplicates are rare,
-        # drop all but the first and warn.
+        # PDFs can have multiple attributes with the same name, but
+        # some output formats (such as XML) cannot. As duplicates are
+        # rare, drop all but the first and warn.
         filtered, seen = [], set()
         for a in self.attributes:
             if str(a.name) not in seen:
@@ -387,9 +413,8 @@ class StructElem(StructElemBase):
             file=out
         )
         if self.get_content_text():
-            self.print_indent(indent+1, out)
-            text = self.get_content_text()
-            print(f'<content text={clean_xml_attr(text)}/>', file=out)
+            # Only leaf nodes should hold content
+            raise ValueError('unexpected content')
         for child in self.children:
             child.write_struct_tree(fmt, indent+1, out)
         self.print_indent(indent, out)
@@ -408,11 +433,12 @@ class StructElem(StructElemBase):
 
     def __str__(self):
         attrs = ''.join(f' {a}' for a in self.attributes)
+        bboxes = [self.get_bbox(i) for i in self._pages]
         return (
             f'StructElem('
             f'type={self.struct_type}'
-            f' pages={sorted(self._content_by_page.keys())}'
-            f' bbox={self.bboxes()}'
+            f' pages={self.get_page_indices()}'
+            f' bbox={bboxes}'
             f'{attrs})'
         )
 
@@ -423,6 +449,7 @@ class MCIDStructElem(StructElemBase):
         super().__init__(root, parent)
         self.struct_type = 'MCID'
         self.mcid = mcid
+        self._content_by_page = {}
 
     def is_content(self):
         return True
@@ -430,9 +457,29 @@ class MCIDStructElem(StructElemBase):
     def is_objref(self):
         return False
 
+    def _add_content_item(self, page, item, mcid):
+        assert mcid == self.mcid
+        if page not in self._content_by_page:
+            self._content_by_page[page] = []
+        self._content_by_page[page].append(item)
+
+    def _get_direct_content(self, page=None):
+        if page is not None:
+            return self._content_by_page.get(page, [])
+        else:    # all pages
+            return [
+                item for page, items in sorted(self._content_by_page.items())
+                for item in items
+            ]
+
+    def _get_subtree_content(self, page=None):
+        return self._get_direct_content(page)    # leaf
+
     def write_struct_tree(self, fmt, indent=0, out=sys.stdout):
         if fmt == OutputFormat.pdfinfo:
-            pass    # not included in `pdfinfo -struct` output
+            if self.get_content():
+                self.print_indent(indent, out)
+                print(f'"{self.get_content_text()}"')
         elif fmt == OutputFormat.xml:
             self.print_indent(indent, out)
             print(
@@ -451,44 +498,23 @@ class MCIDStructElem(StructElemBase):
     def __str__(self):
         return f'MCID({self.mcid})'
 
-
-class MCRefStructElem(StructElemBase):
-    """Marked-content reference structure tree leaf."""
-    def __init__(self, dictionary: Dictionary, root: StructTreeRoot, parent):
-        super().__init__(root, parent)
-        self.dictionary = dictionary
+    @classmethod
+    def from_dictionary(cls, dictionary: Dictionary, root: StructTreeRoot,
+                        parent):
+        """Create MCIDStructElem from given dictionary."""
+        mcid = parsing.get_integer(dictionary, Name.MCID, required=True)
+        struct_elem = cls(mcid, root, parent)
+        struct_elem.dictionary = dictionary
 
         # See Reference Table 324 "Entries in a marked-content
         # reference dictionary"
         assert dictionary[Name.Type] == Name.MCR
-        self.struct_type = dictionary[Name.Type]
-        self.mcid = parsing.get_integer(dictionary, Name.MCID, required=True)
+        struct_elem.struct_type = dictionary[Name.Type]
 
         # TODO check types here, handle optional StmOwn
-        self.page = parsing.get_dictionary(dictionary, Name.Pg)
-        self.stream = dictionary.get(Name.Stm)
-
-    def is_content(self):
-        return True
-
-    def is_objref(self):
-        return False
-
-    def write_struct_tree(self, fmt, indent=0, out=sys.stdout):
-        if fmt == OutputFormat.pdfinfo:
-            pass    # not included in `pdfinfo -struct` output
-        elif fmt == OutputFormat.xml:
-            self.print_indent(indent, out)
-            type_ = str(self.struct_type)[1:]
-            print(
-                ''.join([
-                    f'<{type_}',
-                    f' mcid="{self.mcid}"',
-                    f'/>']),
-                file=out
-            )
-        else:
-            raise NotImplementedError
+        struct_elem.page = parsing.get_dictionary(dictionary, Name.Pg)
+        struct_elem.stream = dictionary.get(Name.Stm)
+        return struct_elem
 
 
 class ObjRefStructElem(StructElemBase):
