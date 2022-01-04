@@ -73,13 +73,20 @@ class ContentTag:
 
 class TaggedContent:
     def __init__(self):
+        self.pages = []
         self.content_by_page = defaultdict(list)
         self.items_by_page_and_mcid = defaultdict(lambda: defaultdict(list))
+        self.nonmarked_items_by_page = defaultdict(list)
+
+    def add_page(self, page):
+        self.pages.append(page)
 
     def add_item(self, page, tags, item):
-        for tag in tags:
-            if tag.mcid is not None:
-                self.items_by_page_and_mcid[page][tag.mcid].append(item)
+        mcid = self.get_mcid(tags)
+        if mcid is not None:
+            self.items_by_page_and_mcid[page][mcid].append(item)
+        else:
+            self.nonmarked_items_by_page[page].append(item)
         tagged_item = TaggedContentItem(tags[:], item)
         self.content_by_page[page].append(tagged_item)
 
@@ -136,6 +143,15 @@ class TaggedContent:
                     attrs[key] = f'{attrs[key]},{v}'
         self.output_xml_element(out, xml_tag, attrs, text, depth)
 
+    @staticmethod
+    def get_mcid(tags):
+        mcids = [tag.mcid for tag in tags if tag.mcid is not None]
+        if not mcids:
+            return None
+        elif len(mcids) == 1:
+            return mcids[0]
+        else:
+            raise ValueError(f'multiple MCIDs: {mcids}')
 
     @staticmethod
     def output_indent(out, depth):
@@ -177,12 +193,10 @@ class TaggedContent:
 
 
 class TaggedContentExtractor(PDFLayoutAnalyzer):
-    def __init__(self, resource_manager):    #, pdf_struct):
+    def __init__(self, resource_manager):
         super().__init__(resource_manager)
-        #self.pdf_struct = pdf_struct
         self.page_index = None
         self.current_page = None
-        #self.current_struct_elem = None
         self._tag_stack = []
         self.extracted_content = TaggedContent()
 
@@ -195,6 +209,7 @@ class TaggedContentExtractor(PDFLayoutAnalyzer):
         self.current_page = self.cur_item
         assert isinstance(self.current_page, LTPage)
         assert not self._tag_stack
+        self.extracted_content.add_page(self.current_page)
 
     def end_page(self, *args, **argv):
         super().end_page(*args, **argv)
@@ -230,64 +245,16 @@ class TaggedContentExtractor(PDFLayoutAnalyzer):
 
     def begin_tag(self, tag, props=None):
         # Called by PDFPageInterpreter for BMC and BDC
-        # if not isinstance(props, dict) or 'MCID' not in props:
-        #     return    # not marked content
-        # mcid = props['MCID']
-        #assert self.current_struct_elem is None
-        #self.current_struct_elem = self.get_struct_elem(mcid)
         self._tag_stack.append(ContentTag(self.page_index, tag.name, props))
         # tags can nest, but MCIDs cannot
         assert sum(t.mcid is not None for t in self._tag_stack) < 2
 
     def end_tag(self):
         # Called by PDFPageInterpreter for EMC
-        #self.current_struct_elem = None
-        #self.current_tag = None
         self._tag_stack.pop()
 
     def add_content_item(self, item):
-        type_name = type(item).__name__
-        # if self.current_struct_elem is not None:
-        #     self.current_struct_elem.add_content_item(self.page_index, item)
-        #     self.struct_count[type_name] += 1
-        # else:
-        #     #print(f'non-struct: {item}', file=sys.stderr)
-        #     self.non_struct_count[type_name] += 1
         self.extracted_content.add_item(self.page_index, self._tag_stack, item)
-
-    # def get_struct_elem(self, mcid):
-    #     # From 14.7.4.4 "Finding Structure Elements from Content
-    #     # Items": Because a marked-content sequence is not an
-    #     # object in its own right, its parent tree key shall be
-    #     # found in the StructParents entry of the page object or
-    #     # other content stream in which the sequence resides. The
-    #     # value retrieved from the parent tree shall not be a
-    #     # reference to the parent structure element itself but to
-    #     # an array of such references—one for each marked-content
-    #     # sequence contained within that content stream.  The
-    #     # parent structure element for the given sequence shall be
-    #     # found by using the sequence’s marked-content identifier
-    #     # as an index into this array.
-    #     page_idx = self.page_index
-    #     parent_tree_idx = self.pdf_struct.page_struct_parents[page_idx]
-    #     if parent_tree_idx is None:
-    #         logger.warning(f'missing StructParents for page {page_idx}')
-    #         return None
-    #     struct_tree = self.pdf_struct.struct_tree_root
-    #     parent_tree = struct_tree.parent_tree[parent_tree_idx]
-    #     try:
-    #         parent = parent_tree[mcid]
-    #     except IndexError:
-    #         logger.error(f'invalid reference {mcid} to parent tree of'
-    #                      f' {len(parent_tree)} items')
-    #         return None # raise
-    #     # Grab our StructElem object using objgen lookup.
-    #     struct_elem = struct_tree.get_element(parent.objgen)
-    #     return struct_elem
-
-    def stats(self):
-        s, t = self.struct_char, self.total_char
-        return f'{s/t:.1%} ({s}/{t}) of chars in struct'
 
 
 def extract_content(pdf_path):
@@ -300,21 +267,8 @@ def extract_content(pdf_path):
     return extractor.extracted_content
 
 
-# def add_content(pdf_path, pdf_struct):
-#     # process PDF with pdfminer and TaggedContentExtractor, providing
-#     # the latter with the PdfStruct, through which layout items can be
-#     # attached to the relevant parts of the structure tree.
-#     resource_manager = PDFResourceManager()
-#     extractor = TaggedContentExtractor(resource_manager, pdf_struct)
-#     interpreter = PDFPageInterpreter(resource_manager, extractor)
-#     with open(pdf_path, 'rb') as f:
-#         for page in PDFPage.get_pages(f):
-#             interpreter.process_page(page)
-
-
 def main(argv):
     args = argparser().parse_args()
-
     content = extract_content(args.pdf)
     content.output_xml()
 
