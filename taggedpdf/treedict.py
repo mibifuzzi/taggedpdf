@@ -94,6 +94,9 @@ class NameTree(NameTreeNode):
         self._dict = OrderedDict()
         super().__init__(dictionary, root=self)
 
+    def __len__(self):
+        return len(self._dict)
+
     def __setitem__(self, key, value):
         assert isinstance(key, String)
         key = str(key)
@@ -130,6 +133,9 @@ class NumberTree(NumberTreeNode):
     def __init__(self, dictionary: Dictionary):
         self._dict = OrderedDict()
         super().__init__(dictionary, root=self)
+
+    def __len__(self):
+        return len(self._dict)
 
     def __setitem__(self, key, value):
         assert isinstance(key, int)
