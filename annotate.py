@@ -3,26 +3,24 @@
 # Annotate PDF files based on their logical structure.
 
 import sys
-import io
+import re
+import json
+import uuid
 
 from collections import defaultdict
 from argparse import ArgumentParser
 
+from pdfminer.layout import LTLine, LTRect
 from PyPDF2 import PdfFileWriter, PdfFileReader
-
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4, letter
-from reportlab.lib.units import inch
-from reportlab.lib.colors import Color, black, white
-from reportlab.pdfbase.pdfmetrics import getFont, stringWidth
-
-from pdfminer.layout import LTChar, LTPage, LTFigure, LTRect, LTCurve, LTLine
-from pdfminer.utils import bbox2str
 
 from taggedpdf import TaggedPdf
 from taggedpdf.bbox import BBox
+from taggedpdf.ltitem import layout_item_xml_string
 from taggedpdf.layout import split_into_columns
-from taggedpdf.utils import clean_xml_text, clean_xml_attr
+from taggedpdf.pawls import load_pawls_structure
+from taggedpdf.utils import file_sha256
+from taggedpdf.annotation import Annotation, render_annotations
+from taggedpdf.config import COCO_CATEGORIES, STRUCT_TYPE_TO_LABEL_MAP
 from taggedpdf.logger import logger
 
 
@@ -47,6 +45,12 @@ def argparser():
         help='do not crop annotations to page cropboxes'
     )
     ap.add_argument(
+        '--no-captions',
+        default=False,
+        action='store_true',
+        help='do not assign Caption labels'
+    )
+    ap.add_argument(
         '--keep-overlaps',
         default=False,
         action='store_true',
@@ -59,33 +63,20 @@ def argparser():
         help='include content items in output (XML output only)'
     )
     ap.add_argument(
+        '--pawls-structure',
+        default=None,
+        metavar='JSON',
+        help='PAWLS pdf_structure.json for document (PAWLS output only)'
+    )
+    ap.add_argument(
         '--format',
-        choices={ 'pdf', 'xml' },
+        choices={ 'pdf', 'xml', 'pawls', 'coco' },
         default='pdf',
         help='output format'
     )
     ap.add_argument('input')
     ap.add_argument('output')
     return ap
-
-
-# Mapping from structure types to annotation labels
-STRUCT_TYPE_TO_LABEL_MAP = {
-    'P': 'Paragraph',
-    'LI': 'ListItem',
-    'H1': 'Title',
-    'H2': 'Title',
-    'H3': 'Title',
-    'H4': 'Title',
-    'H5': 'Title',
-    'H6': 'Title',
-    'TOC': 'TableOfContents',
-    'TOCI': 'TocItem',
-    'Table': 'Table',
-    'Figure': 'Figure',
-    'Footnote': 'Footnote',
-    'Note': 'Footnote',
-}
 
 
 # Set of structure types that are annotated
@@ -106,6 +97,7 @@ TRIMMABLE_STRUCT_TYPES = {
     'H5',
     'H6',
     'Note',
+    'Caption',
     # consider also:
     # 'TableOfContents',
     # 'TocItem',
@@ -113,7 +105,7 @@ TRIMMABLE_STRUCT_TYPES = {
 }
 
 
-# Structure types to recurse into
+# Structure types to recurse into for generating annotations
 STRUCT_TYPE_TO_RECURSE_INTO = {
     'Document',
     'NonStruct',
@@ -127,26 +119,15 @@ STRUCT_TYPE_TO_RECURSE_INTO = {
 }
 
 
-# Colors for annotations
-LABEL_TO_HEX_COLOR_MAP = {
-    'Paragraph': '#24DD24',
-    'Title': '#6FDECD',
-    'ListItem': '#D0EC37',
-    'Table' : '#EC3737',
-    'TableOfContents': '#DDBD24',
-    'TocItem': '#CCAD14',
-    'Figure': '#375BEC',
-    'Reference': '#EC9937',
-    'Footnote': '#777777',
-    'Note': '#777777',
-    'Caption': '#E186C0',
+# Structure types that may have captions
+STRUCT_TYPES_WITH_CAPTIONS = {
+    'Table',
+    'Figure',
 }
 
 
-LABEL_TO_COLOR_MAP = {
-    k: (int(v[1:3],16)/255, int(v[3:5],16)/255, int(v[5:7],16)/255)
-    for k, v in LABEL_TO_HEX_COLOR_MAP.items()
-}
+# Structure type to assign to captions
+CAPTION_STRUCT_TYPE = 'Caption'
 
 
 # Number of units to expand minimal annnotation bboxes by
@@ -157,135 +138,6 @@ EXPAND_BBOX_BY = {
     'TableOfContents': 3,
     'Footnote': 2,    # assume slightly smaller font than usual
 }
-
-
-LABEL_FONT_NAME = 'Courier'
-LABEL_FONT_SIZE = 6
-
-
-class Annotation:
-    def __init__(self, type_, bbox, page, layout_items):
-        assert bbox is not None
-        self.type = type_
-        self.bbox = bbox
-        self.page = page
-        self.layout_items = layout_items
-
-    def crop(self, cropbox):
-        cropped_items = []
-        for item in self.layout_items:
-            bbox = cropbox.intersection(item.bbox)
-            if bbox is not None:
-                cropped_items.append(item)
-        if cropped_items == self.layout_items:
-            # If no item was cropped, just crop the bbox
-            self.bbox = cropbox.intersection(self.bbox)
-        else:
-            # Some items were cropped, redo bbox
-            self.layout_items = cropped_items
-            self.bbox = BBox.from_layout_items(self.layout_items)
-            if self.bbox is not None:
-                self.bbox = cropbox.intersection(self.bbox)
-
-    def trim_bbox(self):
-        trimmed_items = []
-        for item in self.layout_items:
-            try:
-                text = item.get_text()
-            except:
-                continue
-            if text and not text.isspace():
-                trimmed_items.append(item)
-        self.layout_items = trimmed_items
-        self.bbox = BBox.from_layout_items(self.layout_items)
-
-    def xml_string(self, include_content=False):
-        type_ = STRUCT_TYPE_TO_LABEL_MAP.get(self.type, self.type)
-        s = (
-            f'<annotation type="{type_}"'
-            f' page="{self.page}"'
-            f' bbox="{self.bbox.coord_str()}"'
-        )
-        if not include_content:
-            return s + '/>'
-        else:
-            s += '>\n'
-            for i in self.layout_items:
-                s += f'  {layout_item_xml_string(i)}\n'
-            s += '</annotation>'
-            return s
-
-    def __str__(self):
-        return f'Annotation(page={self.page} type={self.type} bbox={self.bbox})'
-
-
-def add_labelled_rect(c, llx, lly, urx, ury, label, stroke_color, fill_color,
-                      label_above=False):
-    # primary rectangle
-    c.setStrokeColor(stroke_color)
-    c.setFillColor(fill_color)
-    c.rect(llx, lly, urx-llx, ury-lly, fill=True)
-
-    # text background rectangle
-    text_width = stringWidth(label, LABEL_FONT_NAME, LABEL_FONT_SIZE)
-    c.setFillColor(white)
-    if label_above:
-        box_lly = ury
-    else:
-        box_lly = ury-LABEL_FONT_SIZE    # label inside
-    c.rect(llx, box_lly, text_width+1, LABEL_FONT_SIZE, fill=True)
-
-    # label
-    c.setFont(LABEL_FONT_NAME, LABEL_FONT_SIZE)
-    c.setFillColor(black)
-    text_y = box_lly+0.60*LABEL_FONT_SIZE-2
-    c.drawString(llx+1, text_y, label)
-
-
-def layout_item_xml_string(item):
-    if isinstance(item, LTChar):
-        return (
-            f'<char'
-            f' font={clean_xml_attr(item.fontname)}'
-            f' bbox="{bbox2str(item.bbox)}"'
-            f' colourspace="{item.ncs.name}"'
-            f' ncolour="{item.graphicstate.ncolor}"'
-            f' size="{item.size:.3f}">'
-            f'{clean_xml_text(item.get_text())}'
-            f'</char>'
-        )
-    else:
-        logger.warning(f'TODO {type(item).__name__}')
-        return ''
-
-
-def render_annotations(annotations):
-    data = io.BytesIO()
-    c = canvas.Canvas(data, pagesize=A4)    # TODO pagesize
-    for a in annotations:
-        label = STRUCT_TYPE_TO_LABEL_MAP.get(a.type, a.type)
-        base_color = LABEL_TO_COLOR_MAP.get(label, (0,0,0))
-        #if a.node.struct_type != a.node.original_struct_type:
-        #    label += f' ({a.node.original_struct_type})'
-        try:
-            text = a.node.get_content_text(a.page, recursive=True)
-        except:
-            text=''
-        stroke_color = Color(*base_color, alpha=0.75)
-        fill_color = Color(*base_color, alpha=0.5)
-        add_labelled_rect(
-            c,
-            a.bbox.llx,
-            a.bbox.lly,
-            a.bbox.urx,
-            a.bbox.ury,
-            label,
-            stroke_color,
-            fill_color
-        )
-    c.save()
-    data.seek(0)
-    return PdfFileReader(data)
 
 
 def _annotations_for_node(page, node, args):
@@ -430,11 +282,63 @@ def extend_table_bboxes(page, annotations, nonmarked, margin=4):
     return annotations
 
 
+CAPTION_STRING_RE = re.compile(r'''
+^\s*
+(
+Figure|FIGURE|
+Fig\.|FIG\.|
+Chart|CHART|
+Kaava|KAAVA|
+Picture|PICTURE|
+Table|TABLE|
+Kuva|KUVA|
+Kaavio|KAAVIO|
+Kuvio|KUVIO|
+Taulukko|TAULUKKO|
+Bild|BILD|
+Figur|FIGUR|
+Tabell|TABELL
+)
+\s+\d+
+''', re.VERBOSE)
+
+
+def is_caption_text(string):
+    m = CAPTION_STRING_RE.search(string)
+    if m:
+        logger.info(f'marking as Caption: "{string}" ("{m.group(1)}")')
+        return True
+    else:
+        return False
+
+
+def assign_caption_labels(page, annotations):
+    for a in annotations:
+        if a.type not in STRUCT_TYPES_WITH_CAPTIONS:
+            continue
+        candidates = [
+            c for c in annotations
+            if c is not a and c.bbox.horizontally_overlaps(a.bbox)
+        ]
+        above = [c for c in candidates if c.bbox.is_above(a.bbox)]
+        below = [c for c in candidates if c.bbox.is_below(a.bbox)]
+        above.sort(key=lambda c: c.bbox.vertical_distance(a.bbox))
+        below.sort(key=lambda c: c.bbox.vertical_distance(a.bbox))
+        if above and is_caption_text(above[0].text_content()):
+            above[0].type = CAPTION_STRUCT_TYPE
+        elif below and is_caption_text(below[0].text_content()):
+            below[0].type = CAPTION_STRUCT_TYPE
+    return annotations
+
+
 def get_annotations(page, tagged_pdf, args):
     annotations = [
         annotation for node in tagged_pdf.struct_tree_root.children
         for annotation in _get_annotations(page, node, args)
     ]
+
+    if not args.no_captions:
+        annotations = assign_caption_labels(page, annotations)
 
     if not args.no_text_bbox_trim:
         trimmed_annotations = []
@@ -505,10 +409,88 @@ def annotate_to_xml(infn, outfn, tagged_pdf, args):
             print(f'  <page index="{page_idx}">', file=out)
             for a in get_annotations(page_idx, tagged_pdf, args):
                 for s in a.xml_string(args.include_content).splitlines():
-                    #print(f'    {a.xml_str()}', file=out)
                     print(f'    {s}', file=out)
-            print(f'  </document>', file=out)
+            print(f'  </page>', file=out)
         print(f'</document>', file=out)
+
+
+def annotate_to_pawls(infn, outfn, tagged_pdf, args):
+    if args.pawls_structure is None:
+        print(
+            'Please provide the path to the pdf_structure.json generated'
+            'by `pawls preprocess pdfplumber` with --pawls-structure',
+            file=sys.stderr
+        )
+        return None
+    pawls_document = load_pawls_structure(args.pawls_structure)
+    if len(pawls_document.pages) != tagged_pdf.page_count:
+        raise ValueError('page count mismatch')
+
+    pawls_annotations = []
+    for page_idx in range(tagged_pdf.page_count):
+        pawls_page = pawls_document.pages[page_idx]
+        annotations = get_annotations(page_idx, tagged_pdf, args)
+
+        # Find annotation-token overlaps and assign tokens to the
+        # annotation with which they have maximal relative overlap.
+        tokens_by_annotation = defaultdict(list)
+        for token in pawls_page.tokens:
+            overlaps = []
+            for a in annotations:
+                overlap = token.bbox.relative_overlap(a.bbox)
+                if overlap:
+                    overlaps.append((overlap, a))
+            if overlaps:
+                a = sorted(overlaps, reverse=True)[0][1]
+                a.tokens.append(token)
+
+        for a in annotations:
+            # PAWLS applies some padding (see preannotate.py), match
+            a.bbox = a.bbox.padded(3)    # TODO parameterize
+            pawls_annotations.append(a.pawls_dict(pawls_page.height))
+
+    with open(outfn, 'w') as out:
+        data = { 'annotations': pawls_annotations, 'relations': [] }
+        json.dump(data, out)
+
+
+def annotate_to_coco(infn, outfn, tagged_pdf, args):
+    paper_id = 0
+    coco = {
+        'annotations': [],
+        'categories': COCO_CATEGORIES,
+        'images': [],
+        'papers': [
+            {
+                'id': paper_id,
+                'pages': tagged_pdf.page_count,
+                'paper_sha': file_sha256(infn),
+            }
+        ],
+    }
+    next_ann_id = 0
+    for page_idx in range(tagged_pdf.page_count):
+        page_id = page_idx
+        page_size = tagged_pdf.get_mediabox(page_idx)
+        coco['images'].append({
+            'id': page_id,
+            'page_number': page_idx,
+            'paper_id': paper_id,
+            'width': page_size.width,
+            'height': page_size.height,
+        })
+        for a in get_annotations(page_idx, tagged_pdf, args):
+            coco['annotations'].append({
+                'id': next_ann_id,
+                'image_id': page_idx,
+                'category_id': a.coco_category_id(),
+                'bbox': a.bbox.padded(3).to_coco(page_size.height),
+                'area': a.bbox.area,
+                'iscrowd': False,
+            })
+            next_ann_id += 1
+    with open(outfn, 'w') as out:
+        json.dump(coco, out, indent=2)
 
 
 def annotate(infn, outfn, args):
@@ -521,6 +503,10 @@ def annotate(infn, outfn, args):
         return annotate_to_pdf(infn, outfn, tagged_pdf, args)
     elif args.format == 'xml':
         return annotate_to_xml(infn, outfn, tagged_pdf, args)
+    elif args.format == 'pawls':
+        return annotate_to_pawls(infn, outfn, tagged_pdf, args)
+    elif args.format == 'coco':
+        return annotate_to_coco(infn, outfn, tagged_pdf, args)
     else:
         raise NotImplementedError(f'format {args.format}')
 
