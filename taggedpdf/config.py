@@ -52,22 +52,22 @@ COCO_CATEGORIES = [
       "id": 9,
       "name": "Caption",
       "supercategory": None
-    }
+    },
     {
       "id": 10,
       "name": "Formula",
       "supercategory": None
-    }
+    },
     {
       "id": 11,
       "name": "Code",
       "supercategory": None
-    }
+    },
     {
       "id": 12,
       "name": "Other",
       "supercategory": None
-    }
+    },
 ]
 
 
