@@ -35,7 +35,11 @@ class BBox(NamedTuple):
         return isect_area / union_area
 
     def relative_overlap(self, other):
-        return self.intersection(other).area / self.area
+        isect = self.intersection(other)
+        if isect is None:
+            return 0
+        else:
+            return isect.area / self.area
 
     def union(self, other):
         if isinstance(other, tuple):
@@ -56,6 +60,20 @@ class BBox(NamedTuple):
     def vertically_overlaps(self, other):
         return self.lly < other.ury and other.lly < self.ury
 
+    def is_above(self, other):
+        return self.lly > other.ury
+
+    def is_below(self, other):
+        return other.is_above(self)
+
+    def vertical_distance(self, other):
+        if self.is_above(other):
+            return self.lly - other.ury
+        elif other.is_above(self):
+            return other.lly - self.ury
+        else:
+            return None
+
     def coord_str(self):
         return f'{self.llx:.2f},{self.lly:.2f},{self.urx:.2f},{self.ury:.2f}'
 
@@ -66,6 +84,14 @@ class BBox(NamedTuple):
             self.urx + units,
             self.ury + units,
         )
+
+    def to_coco(self, page_height):
+        return [
+            self.llx,
+            page_height - self.ury,    # invert for y origin at page top
+            self.urx-self.llx,
+            self.ury-self.lly
+        ]
 
     def __str__(self):
         return (
@@ -107,6 +133,14 @@ class BBox(NamedTuple):
         assert attribute.name == Name.BBox
         assert isinstance(attribute.value, Array)
         return cls.from_pikepdf_array(attribute.value)
+
+    @classmethod
+    def from_layoutparser_block(cls, block, page_height):
+        """Return BBox for Layout Parser layout block element."""
+        x1, y1, x2, y2 = block.coordinates
+        # Layout Parser y origin is at page top, so need to invert
+        bottom, top = page_height-y2, page_height-y1
+        return cls(x1, bottom, x2, top)
 
     @staticmethod
     def Union(bboxes):
