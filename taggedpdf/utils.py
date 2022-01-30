@@ -3,6 +3,7 @@ import sys
 import unicodedata
 import xml.etree.ElementTree as ET
 
+from hashlib import sha256
 from xml.sax.saxutils import escape, quoteattr
 
 
@@ -50,3 +51,9 @@ def check_xml(string):
         raise
     return True
 
+
+def file_sha256(path):
+    hash_ = sha256()
+    with open(path, 'rb') as f:
+        hash_.update(f.read())
+    return str(hash_.hexdigest())
