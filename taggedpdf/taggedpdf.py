@@ -119,5 +119,8 @@ class TaggedPdf:
         struct_elem = struct_tree.get_element(parent.objgen)
         return struct_elem
 
+    def get_mediabox(self, page_index):
+        return BBox.from_pikepdf_array(self.pdf.pages[page_index].mediabox)
+
     def get_cropbox(self, page_index):
         return BBox.from_pikepdf_array(self.pdf.pages[page_index].cropbox)
