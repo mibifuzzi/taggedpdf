@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import os
 import json
 import logging
 
@@ -10,6 +11,7 @@ import layoutparser
 
 from argparse import ArgumentParser
 
+from PIL import Image
 from PyPDF2 import PdfFileWriter, PdfFileReader
 
 from taggedpdf.bbox import BBox
@@ -59,6 +61,11 @@ def argparser():
         default='coco',
         help='output format'
     )
+    ap.add_argument(
+        '--image-dir',
+        default=None,
+        help='directory with pdf_to_images.py output'
+    )
     ap.add_argument('input')
     ap.add_argument('output')
     return ap
@@ -99,15 +106,29 @@ def assign_tokens_to_blocks(page, layout):
     return block_tokens, unassigned
 
 
-def convert_pdf(fn):
+def load_images_for_pdf(pdf_path, page_count, args):
+    images = []
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    for i in range(page_count):
+        path = os.path.join(args.image_dir, f'{base}-page{i:04}.png')
+        images.append(Image.open(path))
+    return images
+
+
+def convert_pdf(fn, args):
     logger.info(f'analyzing {fn} using pdfplumber ...')
     page_data = preprocess_with_pdfplumber(fn)
     document = PawlsDocument.from_json(page_data)
     logger.info(f'processed {fn} into {len(document.pages)} pages')
-    
-    logger.info(f'converting {fn} into images ...')
-    images = pdf2image.convert_from_path(fn)
-    logger.info(f'converted {fn} into {len(images)} images')
+
+    if args.image_dir:
+        logger.info(f'loading images for {fn} ...')
+        images = load_images_for_pdf(fn, len(document.pages), args)
+        logger.info(f'loaded {len(images)} images for {fn}')
+    else:
+        logger.info(f'converting {fn} into images ...')
+        images = pdf2image.convert_from_path(fn)
+        logger.info(f'converted {fn} into {len(images)} images')
 
     assert len(document.pages) == len(images), 'page number mismatch'
 
@@ -133,7 +154,7 @@ def predict_annotations(model, image, page):
     annotations = []
     for block in scaled_layout:
         annotation = Annotation(
-            block.type, 
+            block.type,
             BBox.from_layoutparser_block(block, page.height),
             page
         )
@@ -142,7 +163,7 @@ def predict_annotations(model, image, page):
 
 
 def annotate_to_pdf(infn, outfn, model, args):
-    document, images = convert_pdf(infn)
+    document, images = convert_pdf(infn, args)
 
     in_pdf = PdfFileReader(open(infn, 'rb'))
     out_pdf = PdfFileWriter()
@@ -160,7 +181,7 @@ def annotate_to_pdf(infn, outfn, model, args):
 
 
 def annotate_to_xml(infn, outfn, model, args):
-    document, images = convert_pdf(infn)
+    document, images = convert_pdf(infn, args)
 
     with open(outfn, 'w') as out:
         print('<document>', file=out)
@@ -179,7 +200,7 @@ def annotate_to_xml(infn, outfn, model, args):
                 bbox = BBox.from_layoutparser_block(block, page.height)
                 print(f'    <annotation>', file=out)
                 print(block, file=out)    # TODO XML
-                for token in tokens:                
+                for token in tokens:
                     print(token, file=out)    # TODO XML
                 print(f'    </annotation>', file=out)
             print('  </page>', file=out)
@@ -187,7 +208,7 @@ def annotate_to_xml(infn, outfn, model, args):
 
 
 def annotate_to_coco(infn, outfn, model, args):
-    document, images = convert_pdf(infn)
+    document, images = convert_pdf(infn, args)
 
     paper_id = 0
     coco = {
@@ -252,7 +273,7 @@ def main(argv):
     else:
         with open(args.labels) as f:
             labels = json.load(f)
-    
+
     model = layoutparser.Detectron2LayoutModel(
         args.config,
         args.model,
