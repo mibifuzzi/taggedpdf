@@ -82,7 +82,7 @@ STRUCT_TYPE_TO_LABEL_MAP = {
     'H5': 'Title',
     'H6': 'Title',
     'TOC': 'TableOfContents',
-    'TOCI': 'TocItem',
+    'TOCI': 'TableOfContents',    # TocItem
     'Table': 'Table',
     'Figure': 'Figure',
     'Footnote': 'Footnote',
