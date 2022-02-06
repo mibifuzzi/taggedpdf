@@ -1,6 +1,7 @@
 # COCO evaluation using pycocotools
 
 import sys
+import os
 import io
 
 from argparse import ArgumentParser
@@ -12,6 +13,7 @@ from pycocotools.cocoeval import COCOeval
 
 def argparser():
     ap = ArgumentParser()
+    ap.add_argument('--verbose', default=False, action='store_true')
     ap.add_argument('gold')
     ap.add_argument('pred')
     return ap
@@ -28,6 +30,8 @@ def main(argv):
     
     gold = COCO(args.gold)
     pred = COCO(args.pred)
+    
+    name = os.path.splitext(os.path.basename(args.gold))[0]
 
     assure_anns_have_scores(pred)
     
@@ -49,6 +53,8 @@ def main(argv):
             evaluator.summarize()
         avg_prec = evaluator.stats[0] # AP @ IoU=0.50:0.95 area=all maxDets=100
         avg_rec = evaluator.stats[8] # AR @ IoU=0.50:0.95 area=all maxDets=100
+        if args.verbose:
+            print(f'{name} page ', end='')
         print(f'{i}: AP:{avg_prec:.1%} AR:{avg_rec:.1%}')
 
 
