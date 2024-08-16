@@ -1,5 +1,4 @@
 import sys
-
 import unicodedata
 import xml.etree.ElementTree as ET
 
@@ -41,7 +40,6 @@ def check_xml(string):
     try:
         root = ET.fromstring(string)
     except ET.ParseError as e:
-        logger.error('output is not valid XML')
         # following https://stackoverflow.com/a/27779811
         line_num, column = e.position
         lines = string.splitlines()

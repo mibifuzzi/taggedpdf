@@ -482,13 +482,15 @@ class MCIDStructElem(StructElemBase):
                 print(f'"{self.get_content_text()}"')
         elif fmt == OutputFormat.xml:
             self.print_indent(indent, out)
-            print(
-                ''.join([
-                    f'<MCID',
-                    f' mcid="{self.mcid}"',
-                    f'/>']),
-                file=out
-            )
+            print(f'<MCID mcid="{self.mcid}"', end='', file=out)
+            if self.get_content():
+                text = self.get_content_text()
+            else:
+                text = ""
+            if len(text) > 0:
+                print(f'>{text}</MCID>', file=out)
+            else:
+                print('/>', file=out)
         else:
             raise NotImplementedError
 
